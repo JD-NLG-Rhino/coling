@@ -5,7 +5,6 @@ A very basic implementation of neural machine translation
 
 Usage:
     nmt.py --mode=<mode> --train-src=<file> --train-tgt=<file> --dev=<file> --vocab=<file> [options]
-    nmt.py --mode=<mode> [options] MODEL_PATH TEST_FILE TEST_FILE_SP OUTPUT_FILE
     nmt.py --mode=<mode> [options] MODEL_PATH TEST_FILE OUTPUT_FILE
 
 Options:
@@ -42,13 +41,15 @@ Options:
     --num-trial=<int>                       having trained for how many trials [default: 0]
     --best-r2=<float>                       best rouge2 f1 score for the trained models [default: 0.0]
     --best-ppl=<float>                      minimum ppl score for the trained models [default: 1]
-
     --stop-words-file=<file>                stop-word file path [default: data/stopwords_ch]
-    --exclusive-words-file=<file>           exclusive-words file path [default: data/exclusive_words]
+    --exclusive-words-file=<file>           exclusive-words file path [default: data/exclusive_words_empty]
 
     --train-kb-table-file=<file>            train kb kv-pairs file path [default: data/train_kb_acl]
+    --test-kb-table-file=<file>             test kb kv-pairs file path [default: data/test_kb_acl_unique]
     --dev-batch-size=<int>                  dev batch size [default: 20]
 """
+
+
 from __future__ import print_function
 import math
 import pickle
@@ -68,7 +69,7 @@ import torch.nn.utils
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from utils import read_corpus_json, read_corpus, batch_iter, LabelSmoothingLoss, \
+from utils import read_corpus_json, read_corpus, batch_iter, LabelSmoothingLoss,  \
     read_stopwords, replace_digit, read_kb_table, forbid_duplicate, batch_iter_dev
 from vocab import Vocab, VocabEntry
 
@@ -124,6 +125,7 @@ class NMT(nn.Module):
 
         if self.copy:
             self.p_linear = nn.Linear(hidden_size * 3 + embed_size, 1)
+            self.p_linear_table = nn.Linear(hidden_size * 4 + embed_size, 1)
 
         self.label_smoothing = label_smoothing
         if label_smoothing > 0.:
@@ -131,11 +133,33 @@ class NMT(nn.Module):
                                                            tgt_vocab_size=len(vocab.tgt),
                                                            padding_idx=vocab.tgt['<pad>'])
 
+        """ table """
+
+        self.att_key_linear = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.att_value_linear = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+
+        self.att_vec_linear_key = nn.Linear(hidden_size * 2 + hidden_size, hidden_size, bias=False)
+        self.att_vec_linear_value = nn.Linear(hidden_size * 2 + hidden_size, hidden_size, bias=False)
+
+        self.att_ht_linear_key = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.att_ht_linear_value = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        self.att_v_linear_key = nn.Linear(hidden_size, 1, bias=False)
+        self.att_v_linear_value = nn.Linear(hidden_size, 1, bias=False)
+
+        self.encoder_lstm_key = nn.LSTM(embed_size, hidden_size, bidirectional=True)    # key encoder
+        self.encoder_lstm_value = nn.LSTM(embed_size, hidden_size, bidirectional=True)  # value encoder
+
+        self.dropout_skv = nn.Dropout(self.dropout_rate)
+
+        self.att_ua_linear = nn.Linear(hidden_size, 1, bias=True)
+        self.att_wa_linear = nn.Linear(hidden_size * 2, 1, bias=True)
+
     @property
     def device(self):
         return self.src_embed.weight.device
 
-    def forward(self, src_sents, tgt_sents, tgt_vocab_mask):
+    def forward(self, src_sents, tgt_sents, tgt_vocab_mask, table_keys, table_values):
         """
         take a mini-batch of source and target sentences, compute the log-likelihood of
         target sentences.
@@ -149,72 +173,181 @@ class NMT(nn.Module):
                 log-likelihood of generating the gold-standard target sentence for
                 each example in the input batch
         """
-        
         # (src_sent_len, batch_size); (tgt_sent_len, batch_size)
+
         src_sents_var = self.vocab.src.to_input_tensor_src(src_sents, device=self.device)
+
         if self.copy:
-            (tgt_sents_var, src_complete_sents_var, tgt_complete_sents_var,
-             word_oovs, max_oov_num) = self.vocab.tgt.to_input_tensor_tgt(src_sents, tgt_sents, device=self.device)
+            (tgt_sents_var, src_complete_sents_var, tgt_complete_sents_var, word_oovs, max_oov_num) = self.vocab.tgt.to_input_tensor_tgt(src_sents, tgt_sents, device=self.device)
         else:  # TO DO
-            src_sents_var = self.vocab.src.to_input_tensor_src(src_sents, device=self.device)
-            tgt_sents_var = self.vocab.tgt.to_input_tensor_src(tgt_sents, device=self.device)
+            src_sents_var, tgt_sents_var = self.vocab.tgt.to_input_tensor_two(src_sents, tgt_sents, device=self.device)
 
         src_sents_len = [len(s) for s in src_sents]
-
         src_encodings, decoder_init_vec = self.encode(src_sents_var, src_sents_len)
 
         src_sent_masks = self.get_attention_mask(src_encodings, src_sents_len)
 
+        """ table """
+        bs = len(table_values)   # batch_size
+        """ value """
+        value_sents_flat = []    
+        value_sents_flat_len = []  
+        sents_value_words_length = []  
+        max_value_w_n = 0  
+        max_kv_n = 0    
+        """ key """
+        key_sents_flat = []    
+        key_sents_flat_len = []  
+        sents_key_words_length = []  
+        max_key_w_n = 0  
+        sents_key_num = []  
+        for i in range(bs):
+            """ value """
+            table_value = table_values[i]
+            value_words_list = []  
+            value_words_len = []
+            for value in table_value:
+                value_words_list += value
+                value_words_len.append(len(value))
+            value_sents_flat.append(value_words_list)
+            value_sents_flat_len.append(len(value_words_list))
+            max_value_w_n = max(max_value_w_n, len(value_words_list))
+            max_kv_n = max(max_kv_n, len(table_value))
+            sents_value_words_length.append(value_words_len)
+
+            """ key """
+            table_key = table_keys[i]
+            key_words_list = []  
+            key_words_len = []
+            for key in table_key:
+                key_words_list += key
+                key_words_len.append(len(key))
+            key_sents_flat.append(key_words_list)
+            key_sents_flat_len.append(len(key_words_list))
+            max_key_w_n = max(max_key_w_n, len(key_words_list))
+            sents_key_words_length.append(key_words_len)
+            sents_key_num.append(len(table_key))
+
+        """ rank value """
+        value_sents_flat_len_sort, idx_sort = np.sort(np.array(value_sents_flat_len))[::-1], np.argsort(np.array(value_sents_flat_len))[::-1]
+        idx_unsort = np.argsort(idx_sort)
+        value_sents_flat_sort = []
+        value_sents_flat_len_sort_clone = []   
+        for index in idx_sort:
+            value_sents_flat_sort.append(value_sents_flat[index])
+            value_sents_flat_len_sort_clone.append(value_sents_flat_len[index])
+
+        value_sents_flat_ids = self.vocab.src.to_input_tensor_src(value_sents_flat_sort, device=self.device)
+        value_encodings = self.encode_table(value_sents_flat_ids, value_sents_flat_len_sort_clone, 'value')    
+
+        value_encodings = value_encodings.index_select(0, torch.tensor(idx_unsort, dtype=torch.long, device=self.device))
+
+        """ rank key """
+        key_sents_flat_len_sort, idx_sort = np.sort(np.array(key_sents_flat_len))[::-1], np.argsort(np.array(key_sents_flat_len))[::-1]
+        idx_unsort = np.argsort(idx_sort)
+        key_sents_flat_sort = []
+        key_sents_flat_len_sort_clone = []
+        for index in idx_sort:
+            key_sents_flat_sort.append(key_sents_flat[index])
+            key_sents_flat_len_sort_clone.append(key_sents_flat_len[index])
+        key_sents_flat_ids = self.vocab.src.to_input_tensor_src(key_sents_flat_sort, device=self.device)
+        key_encodings = self.encode_table(key_sents_flat_ids, key_sents_flat_len_sort_clone, 'key')  
+
+        key_encodings = key_encodings.index_select(0,torch.tensor(idx_unsort, dtype=torch.long, device=self.device))
+        """ rank end """
+        
+        value_sents_mask = self.get_attention_mask(value_encodings, value_sents_flat_len)  
+
+        sents_key_encoding_mean_mask = torch.zeros(bs, max_kv_n, max_key_w_n)   
+        for i in range(bs):
+            tot_g = 0
+            for j in range(len(sents_key_words_length[i])):
+                step = sents_key_words_length[i][j]   
+                sents_key_encoding_mean_mask[i][j][tot_g: tot_g + step] = 1
+
+                tot_g += step
+        sents_key_encoding_mean_mask = sents_key_encoding_mean_mask.to(self.device)  # (bs, max_kv_n, max_key_w_n)
+
+        key_unfold_mat = torch.zeros(bs, max_kv_n, max_value_w_n)  # (bs, max_kv_n, max_value_w_n)
+        for i in range(bs):
+            tot_g = 0
+            for j in range(len(sents_value_words_length[i])):
+                step = sents_value_words_length[i][j]  
+                key_unfold_mat[i][j][tot_g: tot_g + step] = 1
+                tot_g += step
+        key_unfold_mat = key_unfold_mat.to(self.device)
+        """ key_encoding mean """
+        for i in range(bs):
+            for j in range(len(sents_key_words_length[i]), max_kv_n):   # pad
+                sents_key_words_length[i].append(1)
+
+        sents_key_words_length_tensor = torch.tensor(sents_key_words_length, dtype=torch.float, device=self.device)  # (bs, max_kv_n)
+        sents_key_words_length_tensor = sents_key_words_length_tensor.unsqueeze(dim=-1)  # (bs, max_kv_n, 1)
+        key_encodings_sum = torch.bmm(sents_key_encoding_mean_mask, key_encodings)   # (bs, max_kv_n, hs)
+        key_encodings_mean = key_encodings_sum / sents_key_words_length_tensor   # (bs, max_kv_n, hs)
+
+        key_sents_mask = self.get_attention_mask(key_encodings_mean, sents_key_num)  
+        if self.copy:
+            (_, src_complete_sents_var_table, _, word_oovs_table, max_oov_num_table) = self.vocab.tgt.to_input_tensor_tgt(value_sents_flat, tgt_sents, device=self.device, exist_oovs=word_oovs)
+            max_oov_num = max_oov_num_table
+
         # (tgt_sent_len - 1, batch_size, hidden_size)
         if self.copy and self.coverage:
-            h_ts, ctx_ts, alpha_ts, att_vecs, tgt_word_embeds, coverages = self.decode(src_encodings, src_sent_masks,
-                                                                                       decoder_init_vec,
-                                                                                       tgt_sents_var[:-1])
+            h_ts, ctx_ts, alpha_ts, att_vecs, tgt_word_embeds, coverages = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1])
         elif self.coverage:
-            att_vecs, coverages = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1])
+            att_vecs_src, coverages = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1], key_encodings_mean, key_sents_mask, value_encodings, value_sents_mask, key_unfold_mat)
         elif self.copy:
-            h_ts, ctx_ts, alpha_ts, att_vecs, tgt_word_embeds = self.decode(src_encodings, src_sent_masks,
-                                                                            decoder_init_vec, tgt_sents_var[:-1])
+            h_ts, ctx_ts_src, alpha_ts_src, att_vecs_src, tgt_word_embeds, alpha_ts_key, alpha_ts_value, ctx_ts_skv, ctx_ts_kv, att_vecs_skv = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1],
+                                                                                                     key_encodings_mean, key_sents_mask, value_encodings, value_sents_mask, key_unfold_mat)
+
+
+
+            """ table """
+            alpha_ts_table = alpha_ts_key * alpha_ts_value
             # h_ts:            (tgt_sent_len - 1, batch_size, hidden_size)
             # ctx_ts:          (tgt_sent_len - 1, batch_size, hidden_size * 2)
             # alpha_ts:        (tgt_sent_len - 1, batch_size, src_sent_len)
             # att_vecs:        (tgt_sent_len - 1, batch_size, hidden_size)
             # tgt_word_embeds: (tgt_sent_len - 1, batch_size, embed-size)
         else:
-            att_vecs = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1])
+            att_vecs_src = self.decode(src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var[:-1], key_encodings_mean, key_sents_mask, value_encodings, value_sents_mask, key_unfold_mat)
 
         # (tgt_sent_len - 1, batch_size, tgt_vocab_size)
         if self.copy:
-            scores = self.readout(att_vecs)
-            scores.data.masked_fill_(tgt_vocab_mask.byte(), -float('inf')) 
+            scores = self.readout(att_vecs_skv)  # att_vecs_src -> att_vecs_skv
+            scores.data.masked_fill_(tgt_vocab_mask.byte(), -float('inf'))
             tgt_words_log_prob = F.softmax(scores, dim=-1)
             tgt_words_log_prob = torch.clamp(tgt_words_log_prob, 1e-9, 1 - 1e-9)
-#            print(tgt_words_log_prob)
-#            tgt_words_log_prob = tgt_words_log_prob.data.masked_fill_(tgt_vocab_mask.byte(), float(1e-9))
-#            print("---------------------------------------")
-#            print(tgt_words_log_prob)
-#            print("#######################################")
+
             if max_oov_num > 0:
                 oov_zeros = torch.zeros(tgt_words_log_prob.size(0), tgt_words_log_prob.size(1), max_oov_num,
                                         device=self.device)
                 tgt_words_log_prob = torch.cat([tgt_words_log_prob, oov_zeros], dim=-1)
 
-            p = torch.cat([h_ts, ctx_ts, tgt_word_embeds], dim=-1)
+            p = torch.cat([h_ts, ctx_ts_skv, tgt_word_embeds], dim=-1)
             g = torch.sigmoid(self.p_linear(p))
-            """ avoid loss nan """
+
+            """ 加偏移避免loss nan """
             w = torch.clone(g)
             w[w == 0] = 1e-6
             w[w == 1] = 1 - 1e-6
             g = w
+            # g = torch.clamp(g, 1e-9, 1 - 1e-9)
 
-            src_complete_sents_var_expanded = src_complete_sents_var.permute(1, 0).expand(alpha_ts.size(0), -1, -1)
-            tgt_words_log_prob = (g * tgt_words_log_prob).scatter_add(2, src_complete_sents_var_expanded,
-                                                                      (1 - g) * alpha_ts)
+            """ table """
+            p_table = torch.cat([ctx_ts_kv, ctx_ts_src, tgt_word_embeds], dim=-1)
+            g_table = torch.sigmoid(self.p_linear_table(p_table))
+
+            src_complete_sents_var_expanded = src_complete_sents_var.permute(1, 0).expand(alpha_ts_src.size(0), -1, -1)
+            tgt_words_log_prob = (g * tgt_words_log_prob).scatter_add(2, src_complete_sents_var_expanded, (1 - g) * g_table * alpha_ts_src)  # 54 * 10 * 27000, 54 * 10 * 200
+
+            src_complete_sents_var_expanded_table = src_complete_sents_var_table.permute(1, 0).expand(alpha_ts_table.size(0), -1, -1)
+            tgt_words_log_prob = tgt_words_log_prob.scatter_add(2, src_complete_sents_var_expanded_table, (1 - g) * (1 - g_table) * alpha_ts_table)
 
             # tgt_words_log_prob = torch.log(tgt_words_log_prob)
 
         else:
-            tgt_words_log_prob = F.log_softmax(self.readout(att_vecs), dim=-1)
+            tgt_words_log_prob = F.log_softmax(self.readout(att_vecs_src), dim=-1)
 
         # (tgt_sent_len, batch_size)
         tgt_words_mask = (tgt_sents_var != self.vocab.tgt['<pad>']).float()
@@ -245,6 +378,10 @@ class NMT(nn.Module):
         # scores = tgt_gold_words_log_prob.sum(dim=0)
         scores = tgt_gold_words_log_prob.sum(dim=0) / torch.sum(tgt_words_mask[1:], 0)
 
+        # print("table out : ")
+        # time_out = time.time()
+        # print(time_out)
+        # print("用时", time_out - time_in)
         if self.coverage:
             return scores, coverages
         else:
@@ -286,7 +423,37 @@ class NMT(nn.Module):
 
         return src_encodings, (dec_init_state, dec_init_cell)
 
-    def decode(self, src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var):
+    def encode_table(self, src_sents_var, src_sent_lens, table):
+        """
+        Use a GRU/LSTM to encode source sentences into hidden states
+
+        Args:
+            src_sents: list of source sentence tokens
+
+        Returns:
+            src_encodings: hidden states of tokens in source sentences, this could be a variable
+                with shape (batch_size, source_sentence_length, encoding_dim), or in orther formats
+            decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
+        """
+
+        # (src_sent_len, batch_size, embed_size)
+        src_word_embeds = self.src_embed(src_sents_var)
+        packed_src_embed = pack_padded_sequence(src_word_embeds, src_sent_lens)
+
+        # src_encodings: (src_sent_len, batch_size, hidden_size * 2)
+        if table == 'key':
+            src_encodings, (last_state, last_cell) = self.encoder_lstm_key(packed_src_embed)
+        else:
+            src_encodings, (last_state, last_cell) = self.encoder_lstm_value(packed_src_embed)
+
+        src_encodings, _ = pad_packed_sequence(src_encodings)
+
+        # (batch_size, src_sent_len, hidden_size * 2)
+        src_encodings = src_encodings.permute(1, 0, 2)
+
+        return src_encodings
+
+    def decode(self, src_encodings, src_sent_masks, decoder_init_vec, tgt_sents_var, key_encodings_mean, key_sents_mask, value_encodings, value_sents_mask, key_unfold_mat):
         """
         Given source encodings, compute the log-likelihood of predicting the gold-standard target
         sentence tokens
@@ -304,6 +471,9 @@ class NMT(nn.Module):
 
         # (batch_size, src_sent_len, hidden_size)
         src_encoding_att_linear = self.att_src_linear(src_encodings)
+        # (batch_size, max_kv_n, hidden_size)
+        key_encoding_att_linear = self.att_key_linear(key_encodings_mean)  # table -- key
+        value_encoding_att_linear = self.att_value_linear(value_encodings)  # table -- value
 
         batch_size = src_encodings.size(0)
 
@@ -317,12 +487,19 @@ class NMT(nn.Module):
 
         h_tm1 = decoder_init_vec
 
-        att_ves = []
+        att_ves_src = []
+        att_ves_skv = []
 
         if self.copy:
             h_ts = []
-            ctx_ts = []
-            alpha_ts = []
+            ctx_ts_src = []
+            alpha_ts_src = []
+
+            alpha_ts_key = []
+            alpha_ts_value = []
+
+            ctx_ts_skv = []
+            ctx_ts_kv = []
 
         if self.coverage:
             att_history = None
@@ -340,85 +517,136 @@ class NMT(nn.Module):
                 x = y_tm1_embed
 
             if self.coverage:
-                (h_t, cell_t), ctx_t, alpha_t, att_t = self.step(x, h_tm1, src_encodings, src_encoding_att_linear,
-                                                                 src_sent_masks, att_history)
+                (h_t,
+                 cell_t), ctx_t_src, alpha_t_src, att_t_src, alpha_t_key, alpha_t_value, ctx_t_skv, ctx_t_kv, att_t_skv = self.step(
+                    x, h_tm1, src_encodings, src_encoding_att_linear, src_sent_masks, att_history, key_encodings_mean,
+                    key_encoding_att_linear, key_sents_mask, value_encodings, value_encoding_att_linear, value_sents_mask, key_unfold_mat)
                 if att_history is None:
-                    att_history = alpha_t
+                    att_history = alpha_t_src
                 else:
-                    coverage = torch.min(alpha_t, att_history)
+                    coverage = torch.min(alpha_t_src, att_history)
                     coverages.append(coverage)
-                    att_history = att_history + alpha_t
+                    att_history = att_history + alpha_t_src
             else:
-                (h_t, cell_t), ctx_t, alpha_t, att_t = self.step(x, h_tm1, src_encodings, src_encoding_att_linear,
-                                                                 src_sent_masks, None)
+                (h_t,
+                 cell_t), ctx_t_src, alpha_t_src, att_t_src, alpha_t_key, alpha_t_value, ctx_t_skv, ctx_t_kv, att_t_skv = self.step(
+                    x, h_tm1, src_encodings, src_encoding_att_linear, src_sent_masks, None, key_encodings_mean,
+                    key_encoding_att_linear, key_sents_mask, value_encodings, value_encoding_att_linear, value_sents_mask, key_unfold_mat)
 
-            att_tm1 = att_t
-            h_tm1 = h_t, cell_t
-            att_ves.append(att_t)
+            att_tm1 = att_t_skv  # src -> skv
+            h_tm1 = h_t, cell_t  ]
+            att_ves_src.append(att_t_src)
+            att_ves_skv.append(att_t_skv)
             if self.copy:
                 h_ts.append(h_t)
-                ctx_ts.append(ctx_t)
-                alpha_ts.append(alpha_t)
+
+                ctx_ts_src.append(ctx_t_src)
+                alpha_ts_src.append(alpha_t_src)
+
+                alpha_ts_key.append(alpha_t_key)
+                alpha_ts_value.append(alpha_t_value)
+                ctx_ts_skv.append(ctx_t_skv)
+                ctx_ts_kv.append(ctx_t_kv)
 
         # (tgt_sent_len - 1, batch_size, tgt_vocab_size)
-        att_ves = torch.stack(att_ves)
+        att_ves_src = torch.stack(att_ves_src)
+        att_ves_skv = torch.stack(att_ves_skv)
 
         if self.copy:
             h_ts = torch.stack(h_ts)
-            ctx_ts = torch.stack(ctx_ts)
-            alpha_ts = torch.stack(alpha_ts)
+            ctx_ts_src = torch.stack(ctx_ts_src)
+            alpha_ts_src = torch.stack(alpha_ts_src)
 
+            alpha_ts_key = torch.stack(alpha_ts_key)
+            alpha_ts_value = torch.stack(alpha_ts_value)
+            ctx_ts_skv = torch.stack(ctx_ts_skv)
+            ctx_ts_kv = torch.stack(ctx_ts_kv)
         if self.coverage:
             coverages = torch.stack(coverages)
 
         if self.copy and self.coverage:
-            return h_ts, ctx_ts, alpha_ts, att_ves, tgt_word_embeds, coverages
+            return h_ts, ctx_ts_src, alpha_ts_src, att_ves_src, tgt_word_embeds, coverages
         elif self.coverage:
-            return att_ves, coverages
+            return att_ves_src, coverages
         elif self.copy:
-            return h_ts, ctx_ts, alpha_ts, att_ves, tgt_word_embeds
+            return h_ts, ctx_ts_src, alpha_ts_src, att_ves_src, tgt_word_embeds, alpha_ts_key, alpha_ts_value, ctx_ts_skv, ctx_ts_kv, att_ves_skv
         else:
-            return att_ves
+            return att_ves_src
 
-    def step(self, x, h_tm1, src_encodings, src_encoding_att_linear, src_sent_masks, att_history):
+    def step(self, x, h_tm1, src_encodings, src_encoding_att_linear, src_sent_masks, att_history, key_encodings_mean, key_encoding_att_linear, key_sents_mask, value_encodings, value_encoding_att_linear, value_sents_mask, key_unfold_mat):
         # h_t: (batch_size, hidden_size)
         h_t, cell_t = self.decoder_lstm(x, h_tm1)  # h1 -> h2
 
-        ctx_t, alpha_t = self.dot_prod_attention(h_t, src_encodings, src_encoding_att_linear, src_sent_masks,
-                                                 att_history)
+        ctx_t_src, alpha_t_src, alpha_t_key, alpha_t_value, ctx_t_skv, ctx_t_kv = self.dot_prod_attention(h_t,
+                                                                                                          src_encodings,
+                                                                                                          src_encoding_att_linear,
+                                                                                                          src_sent_masks,
+                                                                                                          att_history,
+                                                                                                          key_encodings_mean,
+                                                                                                          key_encoding_att_linear,
+                                                                                                          key_sents_mask,
+                                                                                                          value_encodings,
+                                                                                                          value_encoding_att_linear,
+                                                                                                          value_sents_mask,
+                                                                                                          key_unfold_mat)
 
-        att_t = torch.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t], 1)))  # E.q. (5)
-        att_t = self.dropout(att_t)
+        att_t_src = torch.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t_src], 1)))  # E.q. (5)
+        att_t_src = self.dropout(att_t_src)
 
-        return (h_t, cell_t), ctx_t, alpha_t, att_t
+        att_t_skv = torch.tanh(self.att_vec_linear(torch.cat([h_t, ctx_t_skv], 1)))  # E.q. (5)
+        att_t_skv = self.dropout_skv(att_t_skv)
+        return (h_t, cell_t), ctx_t_src, alpha_t_src, att_t_src, alpha_t_key, alpha_t_value, ctx_t_skv, ctx_t_kv, att_t_skv
 
-    def dot_prod_attention(self, h_t, src_encoding, src_encoding_att_linear, mask, att_history):
+    def dot_prod_attention(self, h_t, src_encoding, src_encoding_att_linear, mask, att_history, key_encodings_mean, key_encoding_att_linear, key_sents_mask, value_encodings, value_encoding_att_linear, value_sents_mask, key_unfold_mat):
         # (batch_size, src_sent_len, hidden_size) * (batch_size, hidden_size, 1) = (batch_size, src_sent_len)
         # att_weight = torch.bmm(src_encoding_att_linear, h_t.unsqueeze(2)).squeeze(2)
 
         if self.coverage and att_history is not None:
-            att_hidden_text = torch.tanh(self.att_ht_linear(h_t).unsqueeze(1).expand_as(src_encoding_att_linear) +
-                                         att_history.unsqueeze(2).expand_as(
-                                             src_encoding_att_linear) + src_encoding_att_linear)
+            att_hidden_text_src = torch.tanh(
+                self.att_ht_linear(h_t).unsqueeze(1).expand_as(src_encoding_att_linear) + att_history.unsqueeze(2).expand_as(src_encoding_att_linear) + src_encoding_att_linear)
+            att_hidden_text_key = torch.tanh(self.att_ht_linear_key(h_t).unsqueeze(1).expand_as(key_encoding_att_linear) + att_history.unsqueeze(2).expand_as(key_encoding_att_linear) + key_encoding_att_linear)
+            att_hidden_text_value = torch.tanh(self.att_ht_linear_value(h_t).unsqueeze(1).expand_as(value_encoding_att_linear) + att_history.unsqueeze(2).expand_as(value_encoding_att_linear) + value_encoding_att_linear)
         else:
-            att_hidden_text = torch.tanh(
-                self.att_ht_linear(h_t).unsqueeze(1).expand_as(src_encoding_att_linear) + src_encoding_att_linear)
+            att_hidden_text_src = torch.tanh(self.att_ht_linear(h_t).unsqueeze(1).expand_as(src_encoding_att_linear) + src_encoding_att_linear)
+            att_hidden_text_key = torch.tanh(self.att_ht_linear_key(h_t).unsqueeze(1).expand_as(key_encoding_att_linear) + key_encoding_att_linear)
+            att_hidden_text_value = torch.tanh(self.att_ht_linear_value(h_t).unsqueeze(1).expand_as(value_encoding_att_linear) + value_encoding_att_linear)
 
         # (batch_size, src_sent_len)
-        att_weight = self.att_v_linear(att_hidden_text).squeeze(2)
+        att_weight_src = self.att_v_linear(att_hidden_text_src).squeeze(2)
+        att_weight_key = self.att_v_linear_key(att_hidden_text_key).squeeze(2)
+        att_weight_value = self.att_v_linear_value(att_hidden_text_value).squeeze(2)
 
         if mask is not None:
-            att_weight.data.masked_fill_(mask.byte(), -float('inf'))
+            att_weight_src.data.masked_fill_(mask.byte(), -float('inf'))
+        if key_sents_mask is not None:
+            att_weight_key.data.masked_fill_(key_sents_mask.byte(), -float('inf'))
+        if value_sents_mask is not None:
+            att_weight_value.data.masked_fill_(value_sents_mask.byte(), -float('inf'))
 
-        softmaxed_att_weight = F.softmax(att_weight, dim=-1)
+        softmaxed_att_weight_src = F.softmax(att_weight_src, dim=-1)
+        softmaxed_att_weight_value = F.softmax(att_weight_value, dim=-1)  # (bs, max_value_w_n)
+        softmaxed_att_weight_key = F.softmax(att_weight_key, dim=-1)   # (bs, max_kv_n)
 
-        att_view = (att_weight.size(0), 1, att_weight.size(1))
+        softmaxed_att_weight_key = softmaxed_att_weight_key.unsqueeze(dim=1)  # (bs, 1, max_kv_n)
+        softmaxed_att_weight_key = torch.bmm(softmaxed_att_weight_key, key_unfold_mat).squeeze(dim=1)  # (bs, 1, max_kv_n) -> (bs, max_value_w_n)
+
+        att_view_src = (att_weight_src.size(0), 1, att_weight_src.size(1))
+        att_view_value = (att_weight_value.size(0), 1, att_weight_value.size(1))
+
         # (batch_size, hidden_size)
-        ctx_vec = torch.bmm(softmaxed_att_weight.view(*att_view), src_encoding).squeeze(1)
+        ctx_vec_src = torch.bmm(softmaxed_att_weight_src.view(*att_view_src), src_encoding).squeeze(1)  # bs * 1024
 
-        return ctx_vec, softmaxed_att_weight
+        ctx_vec_kv = torch.bmm((softmaxed_att_weight_key * softmaxed_att_weight_value).view(*att_view_value), value_encodings).squeeze(1)
+        beta_src = torch.sigmoid(self.att_ua_linear(h_t) + self.att_wa_linear(ctx_vec_src))
+        beta_kv = torch.sigmoid(self.att_ua_linear(h_t) + self.att_wa_linear(ctx_vec_kv))
+        beta_src, beta_kv = beta_src / (beta_src + beta_kv), beta_kv / (beta_src + beta_kv)
+        #print(ctx_vec_src.shape, ctx_vec_kv.shape)
+        ctx_vec_skv = beta_src * ctx_vec_src + beta_kv * ctx_vec_kv
 
-    def beam_search(self, idx_unsort_dev, src_sents, first_uni2id, first_bi2id, tri2id, beam_size, max_decoding_time_step, stopwords_set, args, tgt_vocab_masks):
+        return ctx_vec_src, softmaxed_att_weight_src, softmaxed_att_weight_key, softmaxed_att_weight_value, ctx_vec_skv, ctx_vec_kv
+
+    def beam_search(self, idx_unsort_dev, src_sents, first_uni2id, first_bi2id, tri2id, beam_size, max_decoding_time_step, stopwords_set, args,
+                    tgt_vocab_masks, table_sents_keys, table_sents_values):
         """
         self, src_enc, src_len, tgt_lang_id, max_len=200, sample_temperature=None, x1=None):
         Decode a sentence given initial start.
@@ -436,7 +664,7 @@ class NMT(nn.Module):
             - lang_id if only one language is involved (LM)
             - (lang_id1, lang_id2) if two languages are involved (MT)
         """
-        
+
         # check inputs
         # assert src_enc.size(0) == src_len.size(0)
         assert beam_size >= 1
@@ -445,7 +673,6 @@ class NMT(nn.Module):
         bs = len(src_sents)  # batch_size
         n_words = len(self.vocab.tgt)  # self.n_words
         src_sents_len = [len(s) for s in src_sents]
-        """ alpha_w """
 
         src_sents_var = self.vocab.src.to_input_tensor_src(src_sents, device=self.device)
         src_encodings, dec_init_vec = self.encode(src_sents_var, src_sents_len)
@@ -455,7 +682,113 @@ class NMT(nn.Module):
         if self.copy:
             (src_complete_sents_var, word_oovs, max_oov_num) = self.vocab.tgt.to_input_tensor_tgt_decode(src_sents, device=self.device)
 
-            n_words += max_oov_num
+
+        """ table value """
+        value_sents_flat = []    # bs * words
+        value_sents_flat_len = []  # bs * words_n
+        sents_value_words_length = []  # bs * kv_n * words_n
+        max_value_w_n = 0  
+        max_kv_n = 0    
+        """ table key """
+        key_sents_flat = []    # bs * words
+        key_sents_flat_len = []  # bs * words_n
+        sents_key_words_length = []  # bs * kv_n * words_n
+        max_key_w_n = 0  
+        sents_key_num = []  
+        for i in range(bs):
+            """ value """
+            table_value = table_sents_values[i]
+            value_words_list = []  
+            value_words_len = []
+            for value in table_value:
+                value_words_list += value
+                value_words_len.append(len(value))
+            value_sents_flat.append(value_words_list)
+            value_sents_flat_len.append(len(value_words_list))
+            max_value_w_n = max(max_value_w_n, len(value_words_list))
+            max_kv_n = max(max_kv_n, len(table_value))
+            sents_value_words_length.append(value_words_len)
+
+            """ key """
+            table_key = table_sents_keys[i]
+            key_words_list = []  
+            key_words_len = []
+            for key in table_key:
+                key_words_list += key
+                key_words_len.append(len(key))
+            key_sents_flat.append(key_words_list)
+            key_sents_flat_len.append(len(key_words_list))
+            max_key_w_n = max(max_key_w_n, len(key_words_list))
+            sents_key_words_length.append(key_words_len)
+            sents_key_num.append(len(table_key))
+
+        """ value """
+        value_sents_flat_len_sort, idx_sort = np.sort(np.array(value_sents_flat_len))[::-1], np.argsort(np.array(value_sents_flat_len))[::-1]
+        idx_unsort = np.argsort(idx_sort)
+        value_sents_flat_sort = []
+        value_sents_flat_len_sort_clone = []   
+        for index in idx_sort:
+            value_sents_flat_sort.append(value_sents_flat[index])
+            value_sents_flat_len_sort_clone.append(value_sents_flat_len[index])
+
+        value_sents_flat_ids = self.vocab.src.to_input_tensor_src(value_sents_flat_sort, device=self.device)
+        value_encodings = self.encode_table(value_sents_flat_ids, value_sents_flat_len_sort_clone, 'value')    
+
+        value_encodings = value_encodings.index_select(0, torch.tensor(idx_unsort, dtype=torch.long, device=self.device))
+
+        """ key """
+        key_sents_flat_len_sort, idx_sort = np.sort(np.array(key_sents_flat_len))[::-1], np.argsort(np.array(key_sents_flat_len))[::-1]
+        idx_unsort = np.argsort(idx_sort)
+        key_sents_flat_sort = []
+        key_sents_flat_len_sort_clone = []
+        for index in idx_sort:
+            key_sents_flat_sort.append(key_sents_flat[index])
+            key_sents_flat_len_sort_clone.append(key_sents_flat_len[index])
+        key_sents_flat_ids = self.vocab.src.to_input_tensor_src(key_sents_flat_sort, device=self.device)
+        key_encodings = self.encode_table(key_sents_flat_ids, key_sents_flat_len_sort_clone, 'key')  
+
+        key_encodings = key_encodings.index_select(0, torch.tensor(idx_unsort, dtype=torch.long, device=self.device))
+
+        value_sents_mask = self.get_attention_mask(value_encodings, value_sents_flat_len)  
+
+        sents_key_encoding_mean_mask = torch.zeros(bs, max_kv_n, max_key_w_n)   
+        for i in range(bs):
+            tot_g = 0
+            for j in range(len(sents_key_words_length[i])):
+                step = sents_key_words_length[i][j]   
+                sents_key_encoding_mean_mask[i][j][tot_g: tot_g + step] = 1
+
+                tot_g += step
+        sents_key_encoding_mean_mask = sents_key_encoding_mean_mask.to(self.device)  # (bs, max_kv_n, max_key_w_n)
+
+        key_unfold_mat = torch.zeros(bs, max_kv_n, max_value_w_n)  # (bs, max_kv_n, max_value_w_n)
+        for i in range(bs):
+            tot_g = 0
+            for j in range(len(sents_value_words_length[i])):
+                step = sents_value_words_length[i][j]  
+                key_unfold_mat[i][j][tot_g: tot_g + step] = 1
+                tot_g += step
+        key_unfold_mat = key_unfold_mat.to(self.device)
+        """ key_encoding mean """
+        for i in range(bs):
+            for j in range(len(sents_key_words_length[i]), max_kv_n):   # pad
+                sents_key_words_length[i].append(1)
+
+        sents_key_words_length_tensor = torch.tensor(sents_key_words_length, dtype=torch.float, device=self.device)  # (bs, max_kv_n)
+        sents_key_words_length_tensor = sents_key_words_length_tensor.unsqueeze(dim=-1)  # (bs, max_kv_n, 1)
+        key_encodings_sum = torch.bmm(sents_key_encoding_mean_mask, key_encodings)   # (bs, max_kv_n, hs)
+        key_encodings_mean = key_encodings_sum / sents_key_words_length_tensor   # (bs, max_kv_n, hs)
+
+        key_sents_mask = self.get_attention_mask(key_encodings_mean, sents_key_num)  
+
+        if self.copy:
+            (src_complete_sents_var_table, word_oovs_table, max_oov_num_table) = self.vocab.tgt.to_input_tensor_tgt_decode(value_sents_flat, device=self.device, exist_oovs=word_oovs)
+            max_oov_num = max_oov_num_table
+            word_oovs = word_oovs_table
+
+        n_words += max_oov_num
+        key_encodings_att_linear = self.att_key_linear(key_encodings_mean)
+        value_encodings_att_linear = self.att_value_linear(value_encodings)
 
         eos_id = self.vocab.tgt['</s>']
 
@@ -463,16 +796,36 @@ class NMT(nn.Module):
         for i in range(2):
             h_tm1.append(dec_init_vec[i].unsqueeze(1).expand((bs, beam_size) + dec_init_vec[i].shape[1:]).contiguous().view((bs * beam_size,) + dec_init_vec[i].shape[1:]))
         h_tm1 = tuple(h_tm1)
+        # h_tm1 = []
+        # for i in range(bs):
+        #     for _ in range(beam_size):
+        #         h_tm1.append(dec_init_vec[0][i,:])
+        # h_tm1 = torch.stack(h_tm1)
 
         att_tm1 = torch.zeros(bs * beam_size, self.hidden_size, device=self.device)
+
+        # expand to beam size the source latent representations / source lengths
+        # x1_beam = x1.unsqueeze(-1).expand(x1.size()[0], bs, beam_size).contiguous().view(-1, bs * beam_size)
+        # src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
+        # src_len = src_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
 
         src_encodings = src_encodings.unsqueeze(1).expand((bs, beam_size) + src_encodings.shape[1:]).contiguous().view((bs * beam_size,) + src_encodings.shape[1:])
         src_encodings_att_linear = src_encodings_att_linear.unsqueeze(1).expand((bs, beam_size) + src_encodings_att_linear.shape[1:]).contiguous().view((bs * beam_size,) + src_encodings_att_linear.shape[1:])
         src_sent_masks = src_sent_masks.unsqueeze(1).expand((bs, beam_size) + src_sent_masks.shape[1:]).contiguous().view((bs * beam_size,) + src_sent_masks.shape[1:])
-        
-        if self.copy:
-            src_complete_sents_var = src_complete_sents_var.unsqueeze(2).expand(src_complete_sents_var.shape[:1] + (bs, beam_size)).contiguous().view(src_complete_sents_var.shape[:1] + (bs * beam_size,))
 
+        key_encodings_mean = key_encodings_mean.unsqueeze(1).expand((bs, beam_size) + key_encodings_mean.shape[1:]).contiguous().view((bs * beam_size,) + key_encodings_mean.shape[1:])
+        key_encodings_att_linear = key_encodings_att_linear.unsqueeze(1).expand((bs, beam_size) + key_encodings_att_linear.shape[1:]).contiguous().view((bs * beam_size,) + key_encodings_att_linear.shape[1:])
+        key_sents_mask = key_sents_mask.unsqueeze(1).expand((bs, beam_size) + key_sents_mask.shape[1:]).contiguous().view((bs * beam_size,) + key_sents_mask.shape[1:])
+
+        value_encodings = value_encodings.unsqueeze(1).expand((bs, beam_size) + value_encodings.shape[1:]).contiguous().view((bs * beam_size,) + value_encodings.shape[1:])
+        value_encodings_att_linear = value_encodings_att_linear.unsqueeze(1).expand((bs, beam_size) + value_encodings_att_linear.shape[1:]).contiguous().view((bs * beam_size,) + value_encodings_att_linear.shape[1:])
+        value_sents_mask = value_sents_mask.unsqueeze(1).expand((bs, beam_size) + value_sents_mask.shape[1:]).contiguous().view((bs * beam_size,) + value_sents_mask.shape[1:])
+
+        key_unfold_mat = key_unfold_mat.unsqueeze(1).expand((bs, beam_size) + key_unfold_mat.shape[1:]).contiguous().view((bs * beam_size,) + key_unfold_mat.shape[1:])
+
+        src_complete_sents_var = src_complete_sents_var.unsqueeze(2).expand(src_complete_sents_var.shape[:1] + (bs, beam_size)).contiguous().view(src_complete_sents_var.shape[:1] + (bs * beam_size,))
+
+        src_complete_sents_var_table = src_complete_sents_var_table.unsqueeze(2).expand(src_complete_sents_var_table.shape[:1] + (bs, beam_size)).contiguous().view(src_complete_sents_var_table.shape[:1] + (bs * beam_size,))
         src_sents_len = torch.tensor(src_sents_len, device=self.device)
         src_sents_len = src_sents_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
 
@@ -500,7 +853,7 @@ class NMT(nn.Module):
         # done sentences
         done = [False for _ in range(bs)]
 
-        """ rule for alpha write """
+        """ forbid unk """
         forbidden_ids = []
         for _ in range(bs):
             forbidden = []
@@ -509,58 +862,51 @@ class NMT(nn.Module):
             forbidden_ids.append(forbidden)
 
         while cur_len < max_decoding_time_step:
-            """
-            tensor, attn_dist, p_gens, coverages = self.forward(
-                'fwd',
-                x=generated[:cur_len],
-                lengths=src_len.new(bs * beam_size).fill_(cur_len),
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                cache=cache
-            )
-            """
             y_tm1 = torch.tensor([hyp.item() if hyp.item() < len(self.vocab.tgt) else self.vocab.tgt["<unk>"] for hyp in generated[cur_len-1, :]], dtype=torch.long, device=self.device)
-            y_tm1_embed = self.tgt_embed(y_tm1)  # 所有的，假设的sent的最后一个词，的list
-             
-            if self.input_feed:  # attention计算
+            y_tm1_embed = self.tgt_embed(y_tm1)  
+           
+            if self.input_feed:  
                 x = torch.cat([y_tm1_embed, att_tm1], dim=-1)
             else:
                 x = y_tm1_embed
 
-            (h_t, cell_t), ctx_t, alpha_t, att_t = self.step(x, h_tm1, src_encodings,src_encodings_att_linear, src_sent_masks, None)
-            
+            (h_t, cell_t), ctx_t_src, alpha_t_src, att_t_src, alpha_t_key, alpha_t_value, ctx_t_skv, ctx_t_kv, att_t_skv = self.step(x, h_tm1, src_encodings, src_encodings_att_linear,
+                             src_sent_masks, None, key_encodings_mean, key_encodings_att_linear, key_sents_mask, value_encodings, value_encodings_att_linear, value_sents_mask, key_unfold_mat)
+            """ table """
+            alpha_t_table = alpha_t_key * alpha_t_value
             if self.copy:
-                p_gen = F.softmax(self.readout(att_t), dim=-1)  # 生成概率 att_t_src -> att_t_skv
+                p_gen = F.softmax(self.readout(att_t_skv), dim=-1)  
                 p_gen.data.masked_fill_(tgt_vocab_masks.byte(), float(0))
                 if max_oov_num > 0:
                     oov_zeros = torch.zeros(p_gen.size(0), max_oov_num, device=self.device)
                     p_gen = torch.cat([p_gen, oov_zeros], dim=-1)
 
-                p = torch.cat([h_t, ctx_t, y_tm1_embed], dim=-1)
+                p = torch.cat([h_t, ctx_t_skv, y_tm1_embed], dim=-1)
                 g = torch.sigmoid(self.p_linear(p))
-                #                 epsilon_mask = torch.ones_like(g) * 1e-6
-                #                 g = g + epsilon_mask
-                #                 g[g > 1] = 1
-                """ 加偏移避免loss nan """
+                
+                """ avoid loss nan """
                 w = torch.clone(g)
                 w[w == 0] = 1e-6
                 w[w == 1] = 1 - 1e-6
                 g = w
-                
-                sents_var_complete_src_expanded = src_complete_sents_var.permute(1, 0).expand(alpha_t.size(0), -1)
-                p_t = (g * p_gen).scatter_add(1, sents_var_complete_src_expanded, (1 - g) * alpha_t)
+
+                """ table """
+                p_table = torch.cat([ctx_t_kv, ctx_t_src, y_tm1_embed], dim=-1)
+                g_table = torch.sigmoid(self.p_linear_table(p_table))
+
+                sents_var_complete_src_expanded = src_complete_sents_var.permute(1, 0).expand(alpha_t_src.size(0), -1)
+                p_t = (g * p_gen).scatter_add(1, sents_var_complete_src_expanded, (1 - g) * g_table * alpha_t_src)
+
+                src_complete_sents_var_expanded_table = src_complete_sents_var_table.permute(1, 0).expand(
+                    alpha_t_table.size(0), -1)
+                p_t = p_t.scatter_add(1, src_complete_sents_var_expanded_table, (1 - g) * (1 - g_table) * alpha_t_table)
 
                 log_p_t = torch.log(p_t)
 
             else:
-                log_p_t = F.log_softmax(self.readout(att_t), dim=-1)
-
+                log_p_t = F.log_softmax(self.readout(att_t_src), dim=-1)
 
             scores = log_p_t
-
             assert scores.size() == (bs * beam_size, n_words)
 
             # select next words with scores
@@ -583,6 +929,7 @@ class NMT(nn.Module):
 
             # for each sentence
             for sent_id in range(bs):
+                test_list = []
                 # if we are done with this sentence
                 done[sent_id] = done[sent_id] or generated_hyps[sent_id].is_done(next_scores[sent_id].max().item())
                 if done[sent_id]:
@@ -607,23 +954,21 @@ class NMT(nn.Module):
                         word_value = word_oovs[sent_id][word_id.item() - len(self.vocab.tgt)]
                     else:
                         word_value = self.vocab.tgt.id2word[word_id.item()]
-                    new_hyp_sent = [self.vocab.tgt.id2word[prefix_word_id.item()] if prefix_word_id.item() < len(self.vocab.tgt) else word_oovs[sent_id][prefix_word_id.item() - len(self.vocab.tgt)] for prefix_word_id in generated[1: cur_len, sent_id * beam_size + beam_id: sent_id * beam_size + beam_id + 1]] + [word_value]  # 跳过<s>
                     
+                    new_hyp_sent = [self.vocab.tgt.id2word[prefix_word_id.item()] if prefix_word_id.item() < len(self.vocab.tgt) else word_oovs[sent_id][prefix_word_id.item() - len(self.vocab.tgt)] for prefix_word_id in generated[1: cur_len, sent_id * beam_size + beam_id: sent_id * beam_size + beam_id + 1]] + [word_value]  
+ 
                     # end of sentence, or next word
                     if word_id == eos_id or cur_len + 1 == max_decoding_time_step:
                         generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(), value.item())
                     else:
                         next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
-                        
-                        if self.copy:
-                            forbid_duplicate(self, base_id, new_hyp_sent, forbidden_id_list, word_oovs=word_oovs[sent_id], first_uni2id=first_uni2id, first_bi2id=first_bi2id, tri2id=tri2id)
-                        else:
-                            forbid_duplicate(self, base_id, new_hyp_sent, forbidden_id_list, word_oovs=None, first_uni2id=first_uni2id, first_bi2id=first_bi2id, tri2id=tri2id)
+                    
+                        forbid_duplicate(self, base_id, new_hyp_sent, forbidden_id_list, word_oovs=word_oovs[sent_id], first_uni2id=first_uni2id, first_bi2id=first_bi2id, tri2id=tri2id)
 
                     # the beam for next step is full
                     if len(next_sent_beam) == beam_size:
                         break
-                
+           #     print('\t'.join(test_list))
                 forbidden_ids.append(forbidden_id_list)
 
                 # update next beam content
@@ -639,7 +984,7 @@ class NMT(nn.Module):
             beam_words = generated.new([x[1] for x in next_batch_beam])
             beam_idx = src_sents_len.new([x[2] for x in next_batch_beam])
             h_tm1 = (h_t[beam_idx], cell_t[beam_idx]) 
-            att_tm1 = att_t[beam_idx]
+            att_tm1 = att_t_skv[beam_idx]
 
 
             # re-order batch and internal states
@@ -679,8 +1024,10 @@ class NMT(nn.Module):
         
         completed_hypotheses_unsort = []
         for index in idx_unsort_dev:
-            completed_hypotheses_unsort.append(completed_hypotheses[index].split('</s>')[0].strip())
+            completed_hypotheses_unsort.append(completed_hypotheses[index].strip().split('</s>')[0].strip())
+            #print(completed_hypotheses[index].strip().split('</s>')[0].strip())
         return completed_hypotheses_unsort
+
 
     @staticmethod
     def reload(argss):
@@ -767,7 +1114,6 @@ class BeamHypotheses(object):
         else:
             return self.worst_score >= best_sum_logprobs / self.max_len ** self.length_penalty
 
-
 def str_to_bool(str):
     return True if str.lower() == 'true' or str == '1' else False
 
@@ -796,16 +1142,16 @@ def evaluate_ppl(model, dev_data, coverage, batch_size=32, tgt_vocab_masks=None)
 
     with torch.no_grad():
         dev_data_unfold = []
-        for src, tgts in dev_data:
+        for src, tgts, table_keys, table_values in dev_data:
             for tgt in tgts:
-                dev_data_unfold.append([src, tgt])
+                dev_data_unfold.append([src, tgt, table_keys, table_values])
 
-        for src_sents, tgt_sents in batch_iter(dev_data_unfold, batch_size):
+        for src_sents, tgt_sents, table_keys, table_values in batch_iter(dev_data_unfold, batch_size):
             if coverage:
-                loss, coverage_loss = model(src_sents, tgt_sents, tgt_vocab_masks)
+                loss, coverage_loss = model(src_sents, tgt_sents, tgt_vocab_masks, table_keys, table_values,)
                 loss = -loss.sum()
             else:
-                loss = -model(src_sents, tgt_sents, tgt_vocab_masks).sum()
+                loss = -model(src_sents, tgt_sents, tgt_vocab_masks, table_keys, table_values).sum()
 
             cum_loss += loss.item()
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
@@ -844,13 +1190,17 @@ def train(args):
     train_data_src = read_corpus(args['--train-src'], source='src')
     train_data_tgt = read_corpus(args['--train-tgt'], source='tgt')
 
-    """ 读取停用词 词表文件 """
+    """ kb pair """
+    train_table_keys, train_table_values = read_kb_table(args['--train-kb-table-file'])
+
+
+    """ read stop words """
     stopwords_set = read_stopwords(args['--stop-words-file'])
 
-    dev_data_src, dev_data_tgts, _, _ = read_corpus_json(args['--dev'])
+    dev_data_src, dev_data_tgts, dev_table_keys, dev_table_values = read_corpus_json(args['--dev'])
 
-    train_data = list(zip(train_data_src, train_data_tgt))
-    dev_data = list(zip(dev_data_src, dev_data_tgts))
+    train_data = list(zip(train_data_src, train_data_tgt, train_table_keys, train_table_values))
+    dev_data = list(zip(dev_data_src, dev_data_tgts, dev_table_keys, dev_table_values))
 
     train_batch_size = int(args['--batch-size'])
     clip_grad = float(args['--clip-grad'])
@@ -913,6 +1263,7 @@ def train(args):
         model = model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(args['--lr']))
 
+    """ read only-copy words """
     print("make only-copy mask")
     exclusive_words_set = read_stopwords(args['--exclusive-words-file'])
     tgt_vocab_masks = torch.zeros(1, len(model.vocab.tgt), dtype=torch.float)
@@ -930,7 +1281,7 @@ def train(args):
     while True:
         epoch += 1
 
-        for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
+        for src_sents, tgt_sents, table_keys, table_values in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
             train_iter += 1
 
             optimizer.zero_grad()
@@ -939,10 +1290,10 @@ def train(args):
 
             # (batch_size)
             if coverage:
-                example_losses, coverage_losses = model(src_sents, tgt_sents, tgt_vocab_masks)
+                example_losses, coverage_losses = model(src_sents, tgt_sents, tgt_vocab_masks, table_keys, table_values)
                 example_losses = -example_losses
             else:
-                example_losses = -model(src_sents, tgt_sents, tgt_vocab_masks)
+                example_losses = -model(src_sents, tgt_sents, tgt_vocab_masks, table_keys, table_values)
             batch_loss = example_losses.sum()
             loss = batch_loss / batch_size
 
@@ -950,7 +1301,16 @@ def train(args):
                 coverage_loss = coverage_losses.sum() / batch_size
                 loss += coverage_loss
 
+            # print("table in : ")
+            # time_in = time.time()
+            # print(time_in)
+
             loss.backward()
+
+            # print("table out : ")
+            # time_out = time.time()
+            # print(time_out)
+            # print("用时", time_out - time_in)
 
             # clip gradient
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
@@ -1006,9 +1366,11 @@ def train(args):
 
                 dev_hyps = beam_search_dev(model, dev_data_src, beam_size=10,
                                            max_decoding_time_step=int(args['--max-decoding-time-step']),
-                                           stopwords_set=stopwords_set, args=args, tgt_vocab_masks=tgt_vocab_masks)
+                                           stopwords_set=stopwords_set, args=args, tgt_vocab_masks=tgt_vocab_masks,
+                                           table_sents_keys=dev_table_keys, table_sents_values=dev_table_values)
                 #dev_hyps = [hyps[0].value for hyps in dev_hyps]
-                dev_rouge2 = get_rouge2f([tgts for src, tgts in dev_data], dev_hyps)
+                dev_rouge2 = get_rouge2f([tgts for src, tgts, keys, values in dev_data],
+                                         dev_hyps)
 
                 print('validation: iter %d, dev. ppl %f, dev. ROUGE2 %f' % (train_iter,
                                                                             dev_ppl, dev_rouge2), file=sys.stderr)
@@ -1034,11 +1396,6 @@ def train(args):
 
                     if patience == int(args['--patience']):
                         num_trial += 1
-                        print('hit #%d trial' % num_trial, file=sys.stderr)
-                        if num_trial == int(args['--max-num-trial']):
-                            print('early stop!', file=sys.stderr)
-                            print('the best model is from iteration [%d]' % best_model_iter,
-                                  file=sys.stderr)
                         print('hit #%d trial' % num_trial, file=sys.stderr)
                         if num_trial == int(args['--max-num-trial']):
                             print('early stop!', file=sys.stderr)
@@ -1073,14 +1430,13 @@ def train(args):
 
 def get_rouge2f(references, hypotheses):
     references = [[[char for char in "".join(ref)] for ref in refs] for refs in references]
-#    hypotheses = [hyp.split() for hyp in hypotheses]
     hypotheses = [[char for char in "".join(hyp.split())] for hyp in hypotheses]
     # compute ROUGE-2 F1-SCORE
     rouge2f_score = rouge_2_corpus_multiple_target(references, hypotheses)
     return rouge2f_score
 
 
-def beam_search_dev(model, test_data_src, beam_size, max_decoding_time_step, stopwords_set, args, tgt_vocab_masks):
+def beam_search_dev(model, test_data_src, beam_size, max_decoding_time_step, stopwords_set, args, tgt_vocab_masks, table_sents_keys, table_sents_values):
     was_training = model.training
     model.eval()
     dev_batch_size = int(args['--dev-batch-size'])
@@ -1114,13 +1470,18 @@ def beam_search_dev(model, test_data_src, beam_size, max_decoding_time_step, sto
 
     hypotheses = []
     begin_time = time.time()
+    test_data_tuple = list(zip(test_data_src, table_sents_keys, table_sents_values))
+    count = 0
     with torch.no_grad():
-        for src_sent, idx_unsort in batch_iter_dev(test_data_src, batch_size=dev_batch_size, shuffle=False):
+        for src_sent, table_sent_keys, table_sent_values, idx_unsort in batch_iter_dev(test_data_tuple, batch_size=dev_batch_size, shuffle=False):
             example_hyps = model.beam_search(idx_unsort, src_sent, first_uni2id, first_bi2id, tri2id,
                                              beam_size=beam_size, max_decoding_time_step=max_decoding_time_step,
-                                             stopwords_set=stopwords_set, args=args, tgt_vocab_masks=tgt_vocab_masks)
-
+                                             stopwords_set=stopwords_set, args=args, tgt_vocab_masks=tgt_vocab_masks,
+                                             table_sents_keys=table_sent_keys, table_sents_values=table_sent_values)
+          
             hypotheses += example_hyps
+            count += dev_batch_size
+            print(count)
 
     elapsed = time.time() - begin_time
     print('decoded %d examples, took %d s' % (len(test_data_src), elapsed), file=sys.stderr)
@@ -1138,6 +1499,10 @@ def decode(args):
     corpus-level BLEU score.
     """
 
+    """ kb pair """
+    test_table_keys, test_table_values = read_kb_table(args['--test-kb-table-file'])
+
+
     """ read stop words """
     stopwords_set = read_stopwords(args['--stop-words-file'])
 
@@ -1152,7 +1517,7 @@ def decode(args):
 
     """ read only-copy words """
     exclusive_words_set = read_stopwords(args['--exclusive-words-file'])
-    
+
     tgt_vocab_masks = torch.zeros(1, len(model.vocab.tgt), dtype=torch.float)
     for idx, word in model.vocab.tgt.id2word.items():
         if word in exclusive_words_set:
@@ -1165,18 +1530,15 @@ def decode(args):
                                  max_decoding_time_step=int(args['--max-decoding-time-step']),
                                  stopwords_set=stopwords_set,
                                  args=args,
-                                 tgt_vocab_masks=tgt_vocab_masks)
-
+                                 tgt_vocab_masks=tgt_vocab_masks,
+                                 table_sents_keys=test_table_keys,
+                                 table_sents_values=test_table_values)
+    
     with open(args['OUTPUT_FILE'], 'w') as f:
         for hyps in hypotheses:
-            '''
-            result_line = ""
-            for hyp in hyps:
-                result_line += " ".join(hyp.value) + '\t'
-            f.write(result_line.strip().encode('utf-8') + '\n')
-            '''
-            #top_hyp = hyps[0]
-            #hyp_sent = ' '.join(top_hyp.value)
+            print(hyps)
+            top_hyp = hyps
+            hyp_sent = ' '.join(top_hyp)
             f.write(hyps + '\n')
 
 

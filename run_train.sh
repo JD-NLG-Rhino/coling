@@ -4,6 +4,7 @@ gpu_id=$2
 seed=$3
 label_smoothing=0
 dropout=0.2
+#copy=False
 copy=True
 coverage=False
 batch_size=16
@@ -22,6 +23,7 @@ then
     vocab="data/vocab.json"
     train_src="data/train_source_acl"
     train_tgt="data/train_target_acl"
+    train_kb="data/train_kb_acl"
     dev="data/dev_courpus_acl"
     valid_niter=4000
     exclusive_words="data/exclusive_words_${4}"
@@ -35,8 +37,9 @@ else
     vocab="data/vocab.json"
     train_src="data/train_source_acl_500"
     train_tgt="data/train_target_acl_500"
+    train_kb="data/train_kb_acl_500"
     dev="data/dev_courpus_acl_50"
-    valid_niter=100
+    valid_niter=10
     exclusive_words="data/exclusive_words_${4}"
 fi
 
@@ -52,6 +55,7 @@ CUDA_VISIBLE_DEVICES=${gpu_id} python -u nmt.py \
     --vocab ${vocab} \
     --train-src ${train_src} \
     --train-tgt ${train_tgt} \
+    --train-kb-table ${train_kb} \
     --dev-batch-size ${dev_batch_size} \
     --dev ${dev} \
     --exclusive-words-file ${exclusive_words} \
